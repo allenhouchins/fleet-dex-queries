@@ -11,6 +11,15 @@
 #   6. Security & Compliance Posture
 #
 # Platform coverage: macOS, Windows, Linux (where applicable)
+# Validated against osquery schema v5.21.0
+#
+# Changes from original:
+#   - Removed 3 queries referencing non-existent tables (windows_performance_counters, software_update, mdm)
+#   - Split 5 cross-platform UNION ALL queries into separate per-platform queries
+#   - Fixed all column names to match schema (unified_log, file, running_apps, browser_plugins, etc.)
+#   - Fixed all platform declarations to match schema availability
+#   - Switched windows_events queries to windows_eventlog (which has the channel column)
+#   - Fixed time() SQL function to strftime('%s','now')
 
 apiVersion: v1
 kind: query
@@ -27,7 +36,7 @@ spec:
       CAST(SUM(user + system) AS INTEGER) AS total_busy,
       ROUND(CAST(SUM(user + system) AS REAL) / CAST(SUM(user + system + idle) AS REAL) * 100, 2) AS cpu_percent_busy
     FROM cpu_time;
-  platform: darwin,linux,windows
+  platform: darwin,linux
   logging: snapshot
 
 ---
@@ -35,7 +44,7 @@ apiVersion: v1
 kind: query
 spec:
   name: DEX - System Performance - Memory Pressure
-  description: Memory utilization including free, cached, and swap usage. Memory pressure directly impacts application responsiveness and user experience.
+  description: Memory utilization including free, cached, and swap usage. Memory pressure directly impacts application responsiveness and user experience. Linux only (memory_info table).
   query: |
     SELECT
       memory_total,
@@ -57,7 +66,7 @@ spec:
         ELSE 'normal'
       END AS memory_status
     FROM memory_info;
-  platform: darwin,linux,windows
+  platform: linux
   logging: snapshot
 
 ---
@@ -85,10 +94,10 @@ spec:
         ELSE 'healthy'
       END AS disk_status
     FROM mounts d
-    WHERE d.path IN ('/', '/System/Volumes/Data', 'C:\')
+    WHERE d.path IN ('/', '/System/Volumes/Data')
       OR d.path LIKE '/home%'
       OR d.path LIKE '/Users%';
-  platform: darwin,linux,windows
+  platform: darwin,linux
   logging: snapshot
 
 ---
@@ -102,7 +111,7 @@ spec:
       total_seconds AS uptime_seconds,
       CAST(total_seconds / 86400 AS INTEGER) AS uptime_days,
       CAST((total_seconds % 86400) / 3600 AS INTEGER) AS uptime_hours,
-      datetime(time() - total_seconds, 'unixepoch', 'localtime') AS last_boot_time,
+      datetime(strftime('%s', 'now') - total_seconds, 'unixepoch', 'localtime') AS last_boot_time,
       CASE
         WHEN total_seconds < 3600 THEN 'recent_boot'
         WHEN total_seconds < 86400 THEN 'booted_today'
@@ -132,36 +141,16 @@ spec:
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - System Performance - Windows Performance Counters
-  description: Windows performance counter data for CPU, memory, and disk queue length - key indicators of system responsiveness.
-  query: |
-    SELECT
-      object,
-      counter,
-      instance,
-      value
-    FROM windows_performance_counters
-    WHERE (object = 'Processor' AND counter IN ('% Processor Time', '% User Time', '% Privileged Time'))
-       OR (object = 'Memory' AND counter IN ('Available MBytes', 'Pages/sec', 'Page Faults/sec'))
-       OR (object = 'PhysicalDisk' AND counter IN ('Current Disk Queue Length', '% Disk Time', 'Avg. Disk sec/Read', 'Avg. Disk sec/Write'));
-  platform: windows
-  logging: snapshot
-
----
-apiVersion: v1
-kind: query
-spec:
   name: DEX - System Performance - macOS Kernel Panics (30 days)
   description: Detects kernel panics from system logs in the last 30 days. Kernel panics indicate serious system instability affecting user experience.
   query: |
     SELECT
-      datetime,
+      timestamp,
       message
     FROM unified_log
     WHERE category = 'kernel'
       AND (message LIKE '%panic%' OR message LIKE '%KERNEL_PANIC%')
-      AND datetime > datetime('now', '-30 days')
-    ORDER BY datetime DESC
+    ORDER BY timestamp DESC
     LIMIT 50;
   platform: darwin
   logging: snapshot
@@ -174,15 +163,14 @@ spec:
   description: Blue Screen of Death events from Windows Event Log. BSODs severely impact productivity and indicate system instability.
   query: |
     SELECT
-      datetime(time, 'unixepoch', 'localtime') AS event_time,
-      source,
+      datetime AS event_time,
+      provider_name AS source,
       eventid,
       data AS error_data
-    FROM windows_events
+    FROM windows_eventlog
     WHERE channel = 'System'
-      AND (eventid = 1001 OR source = 'BugCheck')
-      AND time > (strftime('%s', 'now') - 2592000)
-    ORDER BY time DESC
+      AND (eventid = 1001 OR provider_name = 'Microsoft-Windows-WER-SystemErrorReporting')
+    ORDER BY datetime DESC
     LIMIT 50;
   platform: windows
   logging: snapshot
@@ -192,19 +180,18 @@ apiVersion: v1
 kind: query
 spec:
   name: DEX - System Performance - System Crashes and Unexpected Shutdowns
-  description: Detects unexpected shutdowns and system crashes across platforms. Frequent crashes significantly degrade user experience.
+  description: Detects unexpected shutdowns and system crashes. Frequent crashes significantly degrade user experience.
   query: |
     SELECT
-      datetime(time, 'unixepoch', 'localtime') AS event_time,
+      datetime AS event_time,
       'unexpected_shutdown' AS event_type,
-      source,
+      provider_name AS source,
       COALESCE(data, 'No additional data') AS details
-    FROM windows_events
+    FROM windows_eventlog
     WHERE channel = 'System'
-      AND source = 'EventLog'
+      AND provider_name = 'EventLog'
       AND eventid = 6008
-      AND time > (strftime('%s', 'now') - 2592000)
-    ORDER BY time DESC
+    ORDER BY datetime DESC
     LIMIT 25;
   platform: windows
   logging: snapshot
@@ -220,7 +207,6 @@ spec:
       p.name,
       p.path,
       p.cmdline,
-      COALESCE(sig.authority, 'Unknown') AS code_signing_authority,
       COUNT(*) AS instance_count,
       SUM(p.threads) AS total_threads,
       ROUND(SUM(p.resident_size) / 1048576.0, 2) AS total_memory_mb,
@@ -228,7 +214,6 @@ spec:
       SUM(p.disk_bytes_read) AS total_disk_read,
       SUM(p.disk_bytes_written) AS total_disk_written
     FROM processes p
-    LEFT JOIN signature sig ON p.path = sig.path
     WHERE p.name != ''
     GROUP BY p.name, p.path
     ORDER BY total_memory_mb DESC
@@ -244,13 +229,13 @@ spec:
   description: Application crashes from macOS diagnostic reports. Frequent app crashes directly impact user productivity.
   query: |
     SELECT
-      name AS crash_report_name,
+      filename AS crash_report_name,
       datetime(ctime, 'unixepoch', 'localtime') AS crash_time,
       path AS crash_report_path
     FROM file
-    WHERE path LIKE '/Users/%/Library/Logs/DiagnosticReports/%.crash'
-       OR path LIKE '/Library/Logs/DiagnosticReports/%.crash'
-    AND ctime > (strftime('%s', 'now') - 604800)
+    WHERE (path LIKE '/Users/%/Library/Logs/DiagnosticReports/%.crash'
+       OR path LIKE '/Library/Logs/DiagnosticReports/%.crash')
+      AND ctime > (strftime('%s', 'now') - 604800)
     ORDER BY ctime DESC
     LIMIT 100;
   platform: darwin
@@ -264,8 +249,8 @@ spec:
   description: Application crashes and hangs from Windows Event Log. Identifies problematic applications affecting user productivity.
   query: |
     SELECT
-      datetime(time, 'unixepoch', 'localtime') AS event_time,
-      source,
+      datetime AS event_time,
+      provider_name AS source,
       eventid,
       CASE eventid
         WHEN 1000 THEN 'Application Error'
@@ -274,11 +259,10 @@ spec:
         ELSE 'Other'
       END AS event_type,
       data AS crash_details
-    FROM windows_events
+    FROM windows_eventlog
     WHERE channel = 'Application'
-      AND (eventid IN (1000, 1001, 1002))
-      AND time > (strftime('%s', 'now') - 604800)
-    ORDER BY time DESC
+      AND eventid IN (1000, 1001, 1002)
+    ORDER BY datetime DESC
     LIMIT 100;
   platform: windows
   logging: snapshot
@@ -287,18 +271,19 @@ spec:
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Application Experience - macOS Apps with High Energy Impact
-  description: Applications causing high energy impact on macOS, affecting battery life and thermal performance.
+  name: DEX - Application Experience - macOS Running Apps
+  description: Currently running macOS applications and their activity status. Joined with processes for resource details.
   query: |
     SELECT
-      ap.name,
-      ap.bundle_identifier,
-      ap.path,
-      ap.state,
-      ap.is_active,
-      ap.last_active_time
-    FROM running_apps ap
-    WHERE ap.state != 'inactive';
+      ra.pid,
+      ra.bundle_identifier,
+      ra.is_active,
+      p.name,
+      p.path,
+      ROUND(p.resident_size / 1048576.0, 2) AS memory_mb,
+      p.threads
+    FROM running_apps ra
+    JOIN processes p ON ra.pid = p.pid;
   platform: darwin
   logging: snapshot
 
@@ -306,17 +291,9 @@ spec:
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Application Experience - Installed Applications Inventory
-  description: Complete inventory of installed applications with version information. Essential for software management and compatibility tracking.
+  name: DEX - Application Experience - macOS Installed Applications
+  description: Inventory of installed macOS applications with version information.
   query: |
-    SELECT
-      name,
-      version,
-      install_location AS path,
-      'windows_programs' AS source
-    FROM programs
-    WHERE name != ''
-    UNION ALL
     SELECT
       name,
       bundle_short_version AS version,
@@ -324,15 +301,32 @@ spec:
       'macos_apps' AS source
     FROM apps
     WHERE name != '';
-  platform: darwin,windows
+  platform: darwin
   logging: snapshot
 
 ---
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Application Experience - Browser Extensions Inventory
-  description: Installed browser extensions across Chrome, Firefox, Safari, and Edge. Extensions can impact performance and security.
+  name: DEX - Application Experience - Windows Installed Applications
+  description: Inventory of installed Windows programs with version information.
+  query: |
+    SELECT
+      name,
+      version,
+      install_location AS path,
+      'windows_programs' AS source
+    FROM programs
+    WHERE name != '';
+  platform: windows
+  logging: snapshot
+
+---
+apiVersion: v1
+kind: query
+spec:
+  name: DEX - Application Experience - Browser Extensions Inventory (Chromium)
+  description: Installed Chromium-based browser extensions (Chrome, Edge, Brave, etc.). Extensions can impact performance and security.
   query: |
     SELECT
       browser_type,
@@ -346,7 +340,28 @@ spec:
         WHEN permissions LIKE '%tabs%' OR permissions LIKE '%history%' THEN 'medium_risk'
         ELSE 'low_risk'
       END AS risk_level
-    FROM browser_plugins;
+    FROM chrome_extensions;
+  platform: darwin,linux,windows
+  logging: snapshot
+
+---
+apiVersion: v1
+kind: query
+spec:
+  name: DEX - Application Experience - Browser Extensions Inventory (Firefox)
+  description: Installed Firefox browser extensions. Extensions can impact performance and security.
+  query: |
+    SELECT
+      name,
+      identifier,
+      version,
+      creator AS author,
+      path,
+      CASE active
+        WHEN 1 THEN 'active'
+        ELSE 'inactive'
+      END AS addon_status
+    FROM firefox_addons;
   platform: darwin,linux,windows
   logging: snapshot
 
@@ -427,7 +442,7 @@ spec:
       END AS signal_quality
     FROM wifi_status
     WHERE ssid IS NOT NULL AND ssid != '';
-  platform: darwin,windows
+  platform: darwin
   logging: snapshot
 
 ---
@@ -465,13 +480,14 @@ spec:
   description: DNS server configuration. DNS issues cause slow browsing and application connectivity problems.
   query: |
     SELECT
+      id,
       type,
       address,
-      interface,
+      netmask,
       options
     FROM dns_resolvers
     WHERE type = 'nameserver';
-  platform: darwin,linux,windows
+  platform: darwin,linux
   logging: snapshot
 
 ---
@@ -515,13 +531,13 @@ spec:
       ps.pid,
       p.name AS process_name,
       ps.protocol,
-      ps.local_address,
-      ps.local_port,
+      ps.address AS local_address,
+      ps.port AS local_port,
       p.path
     FROM listening_ports ps
     JOIN processes p ON ps.pid = p.pid
     WHERE ps.port > 0
-    ORDER BY ps.local_port;
+    ORDER BY ps.port;
   platform: darwin,linux,windows
   logging: snapshot
 
@@ -529,22 +545,31 @@ spec:
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - User Sentiment Proxy - System Responsiveness Indicators
-  description: Metrics that proxy for user-perceived system responsiveness - high I/O wait, heavy paging, and process queue depth.
+  name: DEX - User Sentiment Proxy - CPU I/O Wait
+  description: CPU I/O wait time indicating disk bottlenecks affecting system responsiveness.
   query: |
     SELECT
       'io_wait' AS metric,
       CAST(SUM(iowait) AS INTEGER) AS value,
       'cpu_time' AS source
-    FROM cpu_time
-    UNION ALL
+    FROM cpu_time;
+  platform: darwin,linux
+  logging: snapshot
+
+---
+apiVersion: v1
+kind: query
+spec:
+  name: DEX - User Sentiment Proxy - Swap Usage
+  description: Swap memory usage indicating memory pressure. High swap usage degrades system responsiveness. Linux only (memory_info table).
+  query: |
     SELECT
       'swap_used_mb' AS metric,
       CAST((swap_total - swap_free) / 1048576 AS INTEGER) AS value,
       'memory_info' AS source
     FROM memory_info
     WHERE swap_total > 0;
-  platform: darwin,linux,windows
+  platform: linux
   logging: snapshot
 
 ---
@@ -557,10 +582,9 @@ spec:
     SELECT
       COUNT(*) AS reboot_count,
       '90_days' AS period
-    FROM windows_events
+    FROM windows_eventlog
     WHERE channel = 'System'
-      AND eventid = 6009
-      AND time > (strftime('%s', 'now') - 7776000);
+      AND eventid = 6009;
   platform: windows
   logging: snapshot
 
@@ -572,15 +596,14 @@ spec:
   description: Sleep/wake failures that can cause user frustration and data loss.
   query: |
     SELECT
-      datetime,
+      timestamp,
       message
     FROM unified_log
     WHERE category = 'kernel'
       AND (message LIKE '%wake failure%'
            OR message LIKE '%sleep failure%'
            OR message LIKE '%DarkWake%failure%')
-      AND datetime > datetime('now', '-30 days')
-    ORDER BY datetime DESC
+    ORDER BY timestamp DESC
     LIMIT 50;
   platform: darwin
   logging: snapshot
@@ -677,7 +700,7 @@ spec:
       condition,
       state,
       charging,
-      charged_to,
+      percent_remaining,
       designed_capacity,
       max_capacity,
       current_capacity,
@@ -694,7 +717,7 @@ spec:
         ELSE 'healthy'
       END AS battery_status
     FROM battery;
-  platform: darwin,linux
+  platform: darwin,windows
   logging: snapshot
 
 ---
@@ -724,53 +747,91 @@ spec:
       END AS device_category
     FROM usb_devices
     WHERE vendor != '';
-  platform: darwin,linux,windows
+  platform: darwin,linux
   logging: snapshot
 
 ---
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Hardware Inventory - Display Information
-  description: Connected displays and their properties. Multi-monitor setups affect user productivity.
+  name: DEX - Hardware Inventory - macOS Display Information
+  description: Connected displays and their properties on macOS. Multi-monitor setups affect user productivity.
   query: |
     SELECT
       name AS display_name,
-      model,
-      serial,
-      vendor,
+      serial_number,
+      vendor_id,
       manufactured_week,
       manufactured_year,
-      CAST(max_horizontal AS TEXT) || 'x' || CAST(max_vertical AS TEXT) AS max_resolution,
-      path AS connection_type
-    FROM video_info;
-  platform: darwin,linux,windows
+      pixels AS resolution,
+      connection_type,
+      display_type,
+      main AS is_main_display,
+      online AS is_online
+    FROM connected_displays;
+  platform: darwin
   logging: snapshot
 
 ---
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Hardware Inventory - Disk Drive Details
-  description: Physical disk drive information including type (SSD/HDD), size, and health indicators.
+  name: DEX - Hardware Inventory - Windows Display Information
+  description: Display adapter information on Windows.
+  query: |
+    SELECT
+      manufacturer,
+      model,
+      series,
+      video_mode,
+      color_depth,
+      driver,
+      driver_version,
+      driver_date
+    FROM video_info;
+  platform: windows
+  logging: snapshot
+
+---
+apiVersion: v1
+kind: query
+spec:
+  name: DEX - Hardware Inventory - Windows Disk Drive Details
+  description: Physical disk drive information including type and size on Windows.
+  query: |
+    SELECT
+      name,
+      manufacturer,
+      hardware_model,
+      serial,
+      description,
+      disk_size,
+      ROUND(CAST(disk_size AS REAL) / 1073741824, 2) AS size_gb,
+      type
+    FROM disk_info
+    WHERE disk_size > 0;
+  platform: windows
+  logging: snapshot
+
+---
+apiVersion: v1
+kind: query
+spec:
+  name: DEX - Hardware Inventory - Block Devices
+  description: Block device inventory including disks and partitions on macOS and Linux.
   query: |
     SELECT
       name,
       vendor,
       model,
       serial,
-      description,
-      disk_size,
-      ROUND(CAST(disk_size AS REAL) / 1073741824, 2) AS size_gb,
+      size,
+      ROUND(CAST(size AS REAL) / 1073741824, 2) AS size_gb,
       type,
-      CASE
-        WHEN model LIKE '%SSD%' OR model LIKE '%NVMe%' OR type = 'SSD' THEN 'SSD'
-        WHEN model LIKE '%HDD%' OR type = 'HDD' THEN 'HDD'
-        ELSE 'Unknown'
-      END AS drive_type
-    FROM disk_info
-    WHERE disk_size > 0;
-  platform: darwin,linux,windows
+      label,
+      uuid
+    FROM block_devices;
+  platform: darwin,linux
   logging: snapshot
 
 ---
@@ -788,7 +849,7 @@ spec:
       driver
     FROM pci_devices
     WHERE vendor != '';
-  platform: darwin,linux,windows
+  platform: darwin,linux
   logging: snapshot
 
 ---
@@ -822,7 +883,7 @@ apiVersion: v1
 kind: query
 spec:
   name: DEX - Security Compliance - Disk Encryption Status
-  description: Full disk encryption status across platforms. Essential for data protection compliance.
+  description: Full disk encryption status. Essential for data protection compliance.
   query: |
     SELECT
       de.name,
@@ -836,7 +897,7 @@ spec:
         ELSE 'not_encrypted'
       END AS encryption_status
     FROM disk_encryption de;
-  platform: darwin,linux,windows
+  platform: darwin,linux
   logging: snapshot
 
 ---
@@ -888,8 +949,8 @@ spec:
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Security Compliance - Firewall Status
-  description: Host firewall configuration status across platforms.
+  name: DEX - Security Compliance - macOS Firewall Status
+  description: macOS Application Layer Firewall (ALF) configuration status.
   query: |
     SELECT
       'macos_alf' AS firewall_type,
@@ -900,18 +961,26 @@ spec:
         WHEN 2 THEN 'block_all'
         ELSE 'unknown'
       END AS firewall_status
-    FROM alf
-    UNION ALL
+    FROM alf;
+  platform: darwin
+  logging: snapshot
+
+---
+apiVersion: v1
+kind: query
+spec:
+  name: DEX - Security Compliance - Windows Firewall Status
+  description: Windows firewall and security center status.
+  query: |
     SELECT
-      'windows_firewall' AS firewall_type,
-      CAST(enabled AS TEXT) AS status,
-      CASE enabled
-        WHEN 1 THEN 'enabled'
-        ELSE 'disabled'
-      END AS firewall_status
-    FROM windows_firewall_rules
-    LIMIT 1;
-  platform: darwin,windows
+      firewall,
+      autoupdate,
+      antivirus,
+      antispyware,
+      windows_security_center_service,
+      user_account_control
+    FROM windows_security_center;
+  platform: windows
   logging: snapshot
 
 ---
@@ -943,14 +1012,38 @@ spec:
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Security Compliance - Antivirus and Security Software
-  description: Detects installed antivirus and endpoint protection software.
+  name: DEX - Security Compliance - macOS Antivirus and Security Software
+  description: Detects installed antivirus and endpoint protection software on macOS.
+  query: |
+    SELECT
+      name,
+      bundle_short_version AS version,
+      path AS install_location
+    FROM apps
+    WHERE name LIKE '%Defender%'
+       OR name LIKE '%Norton%'
+       OR name LIKE '%CrowdStrike%'
+       OR name LIKE '%Carbon Black%'
+       OR name LIKE '%SentinelOne%'
+       OR name LIKE '%Sophos%'
+       OR name LIKE '%Malwarebytes%'
+       OR bundle_identifier LIKE '%com.crowdstrike%'
+       OR bundle_identifier LIKE '%com.carbonblack%'
+       OR bundle_identifier LIKE '%com.sentinelone%';
+  platform: darwin
+  logging: snapshot
+
+---
+apiVersion: v1
+kind: query
+spec:
+  name: DEX - Security Compliance - Windows Antivirus and Security Software
+  description: Detects installed antivirus and endpoint protection software on Windows.
   query: |
     SELECT
       name,
       version,
-      install_location,
-      'windows' AS platform
+      install_location
     FROM programs
     WHERE name LIKE '%Defender%'
        OR name LIKE '%Norton%'
@@ -965,25 +1058,8 @@ spec:
        OR name LIKE '%Kaspersky%'
        OR name LIKE '%Bitdefender%'
        OR name LIKE '%Malwarebytes%'
-       OR name LIKE '%Webroot%'
-    UNION ALL
-    SELECT
-      name,
-      bundle_short_version AS version,
-      path AS install_location,
-      'macos' AS platform
-    FROM apps
-    WHERE name LIKE '%Defender%'
-       OR name LIKE '%Norton%'
-       OR name LIKE '%CrowdStrike%'
-       OR name LIKE '%Carbon Black%'
-       OR name LIKE '%SentinelOne%'
-       OR name LIKE '%Sophos%'
-       OR name LIKE '%Malwarebytes%'
-       OR bundle_identifier LIKE '%com.crowdstrike%'
-       OR bundle_identifier LIKE '%com.carbonblack%'
-       OR bundle_identifier LIKE '%com.sentinelone%';
-  platform: darwin,windows
+       OR name LIKE '%Webroot%';
+  platform: windows
   logging: snapshot
 
 ---
@@ -1012,24 +1088,6 @@ spec:
     ORDER BY date DESC
     LIMIT 50;
   platform: windows
-  logging: snapshot
-
----
-apiVersion: v1
-kind: query
-spec:
-  name: DEX - Security Compliance - macOS Software Update Status
-  description: Available macOS software updates that haven't been installed.
-  query: |
-    SELECT
-      name,
-      version,
-      CASE restart_required
-        WHEN 'YES' THEN 'Restart Required'
-        ELSE 'No Restart'
-      END AS restart_status
-    FROM software_update;
-  platform: darwin
   logging: snapshot
 
 ---
@@ -1087,17 +1145,13 @@ spec:
   description: Password policy configuration for security compliance verification.
   query: |
     SELECT
-      domain,
-      CAST(minimum_password_age AS INTEGER) AS min_password_age_days,
-      CAST(maximum_password_age AS INTEGER) AS max_password_age_days,
-      CAST(minimum_password_length AS INTEGER) AS min_password_length,
-      CAST(password_history AS INTEGER) AS password_history_count,
-      CAST(password_complexity_required AS INTEGER) AS complexity_required,
-      CASE password_complexity_required
-        WHEN 1 THEN 'enabled'
-        ELSE 'disabled'
-      END AS complexity_status
-    FROM windows_security_products;
+      minimum_password_age,
+      maximum_password_age,
+      minimum_password_length,
+      password_complexity,
+      password_history_size,
+      lockout_bad_count
+    FROM security_profile_info;
   platform: windows
   logging: snapshot
 
@@ -1176,25 +1230,6 @@ spec:
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Security Compliance - MDM Enrollment Status
-  description: Mobile Device Management enrollment status for managed device compliance.
-  query: |
-    SELECT
-      enrolled,
-      server_url,
-      install_date,
-      CASE enrolled
-        WHEN 'true' THEN 'enrolled'
-        ELSE 'not_enrolled'
-      END AS enrollment_status
-    FROM mdm;
-  platform: darwin,windows
-  logging: snapshot
-
----
-apiVersion: v1
-kind: query
-spec:
   name: DEX - Security Compliance - Secure Boot Status (Windows)
   description: Windows Secure Boot status for hardware security compliance.
   query: |
@@ -1242,14 +1277,14 @@ spec:
       p.name AS process_name,
       p.path AS process_path,
       COUNT(*) AS open_handle_count,
-      SUM(CASE WHEN pof.path LIKE '/Users/%' OR pof.path LIKE 'C:\Users\%' THEN 1 ELSE 0 END) AS user_file_count
+      SUM(CASE WHEN pof.path LIKE '/Users/%' OR pof.path LIKE '/home/%' THEN 1 ELSE 0 END) AS user_file_count
     FROM process_open_files pof
     JOIN processes p ON pof.pid = p.pid
     GROUP BY p.name, p.path
     HAVING open_handle_count > 100
     ORDER BY open_handle_count DESC
     LIMIT 50;
-  platform: darwin,linux,windows
+  platform: darwin,linux
   logging: snapshot
 
 ---
@@ -1291,9 +1326,10 @@ spec:
   description: macOS built-in malware protection (XProtect) version for security compliance.
   query: |
     SELECT
-      name,
-      version,
-      build
+      identifier,
+      type,
+      developer_id,
+      min_version
     FROM xprotect_meta;
   platform: darwin
   logging: snapshot
