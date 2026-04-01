@@ -11,7 +11,7 @@
 #   6. Security & Compliance Posture
 #
 # Platform coverage: macOS, Windows, Linux (where applicable)
-# Validated against osquery schema v5.21.0
+# Validated against osquery schema v5.22.1
 #
 # Changes from original:
 #   - Removed 3 queries referencing non-existent tables (windows_performance_counters, software_update, mdm)
@@ -20,6 +20,14 @@
 #   - Fixed all platform declarations to match schema availability
 #   - Switched windows_events queries to windows_eventlog (which has the channel column)
 #   - Fixed time() SQL function to strftime('%s','now')
+#
+# Merge round (v5.22.1):
+#   - Replaced VPN Connection Status with enriched Network Context (macOS + Windows variants)
+#   - Merged WiFi Signal Quality into enriched WiFi Quality with SNR, band, composite score
+#   - Replaced macOS Device Details with Hardware Profile (cpu_class, ram_tier, os_currency)
+#   - Replaced bare macOS Installed Applications with App Inventory (recency + categorization)
+#   - Added macOS Memory System (virtual_memory_info: swap/compression health)
+#   - Added per-PID Memory Pressure query (process_class + pressure flags)
 
 apiVersion: v1
 kind: query
@@ -67,6 +75,121 @@ spec:
       END AS memory_status
     FROM memory_info;
   platform: linux
+  logging: snapshot
+
+---
+apiVersion: v1
+kind: query
+spec:
+  name: DEX - System Performance - macOS Memory System Health
+  description: >
+    macOS memory subsystem health via virtual_memory_info. Swap usage signals
+    memory exhaustion, compression ratio signals sustained pressure. Complements
+    the Linux-only memory_info query above.
+  query: |
+    SELECT
+      4096                                              AS page_size_bytes,
+
+      free                                              AS pages_free,
+      active                                            AS pages_active,
+      inactive                                          AS pages_inactive,
+      speculative                                       AS pages_speculative,
+      wired                                             AS pages_wired,
+      compressed                                        AS pages_compressed,
+
+      ROUND(CAST(free * 4096 AS REAL) / 1048576, 0)
+                                                        AS free_mb,
+      ROUND(CAST(active * 4096 AS REAL) / 1048576, 0)
+                                                        AS active_mb,
+      ROUND(CAST(wired * 4096 AS REAL) / 1048576, 0)
+                                                        AS wired_mb,
+      ROUND(CAST(compressed * 4096 AS REAL) / 1048576, 0)
+                                                        AS compressed_mb,
+
+      swap_ins                                          AS swap_ins_total,
+      swap_outs                                         AS swap_outs_total,
+
+      CASE
+        WHEN swap_ins > 100000                         THEN 'severe_swap_pressure'
+        WHEN swap_ins > 10000                          THEN 'elevated_swap'
+        WHEN swap_ins > 0                              THEN 'some_swap'
+        ELSE 'no_swap'
+      END                                               AS swap_pressure,
+
+      CASE
+        WHEN compressed > (free + active) * 0.5       THEN 'high_compression'
+        WHEN compressed > free * 0.25                 THEN 'moderate_compression'
+        ELSE 'low_compression'
+      END                                               AS compression_state,
+
+      CASE
+        WHEN swap_ins > 10000
+          OR compressed > (free + active) * 0.5       THEN 'dex_memory_degraded'
+        WHEN swap_ins > 0
+          OR compressed > free * 0.25                 THEN 'dex_memory_stressed'
+        ELSE 'dex_memory_healthy'
+      END                                               AS dex_memory_score
+
+    FROM virtual_memory_info;
+  platform: darwin
+  logging: snapshot
+
+---
+apiVersion: v1
+kind: query
+spec:
+  name: DEX - System Performance - Per-Process Memory Pressure Top 25
+  description: >
+    Per-PID RAM snapshot of top 25 processes by resident memory (>50 MB).
+    Classifies processes as user_app, mgmt_agent, or system and flags memory hogs.
+  query: |
+    SELECT
+      p.name                                            AS process_name,
+      p.path                                            AS process_path,
+      p.pid,
+      p.state,
+
+      ROUND(CAST(p.resident_size AS REAL) / 1048576, 1)
+                                                        AS rss_mb,
+
+      ROUND(CAST(p.total_size AS REAL) / 1073741824, 2)
+                                                        AS vmem_gb,
+
+      p.user_time                                       AS cpu_user_ms,
+      p.system_time                                     AS cpu_sys_ms,
+      p.disk_bytes_written,
+
+      CASE
+        WHEN p.name IN (
+          'Slack','zoom.us','Microsoft Teams','Google Chrome',
+          'Safari','Firefox','Outlook','figma_agent','Code',
+          'notion','Linear','Loom','WebEx'
+        )                                               THEN 'user_app'
+        WHEN p.name IN (
+          'osqueryd','santa','SentinelAgent','CrowdStrike',
+          'sophos','Jamf','kandji'
+        )                                               THEN 'mgmt_agent'
+        WHEN p.name LIKE 'com.apple%'
+          OR p.path LIKE '/System/%'
+          OR p.path LIKE '/usr/%'                       THEN 'system'
+        ELSE 'other'
+      END                                               AS process_class,
+
+      CASE
+        WHEN p.resident_size > 2147483648              THEN 'critical_over_2gb'
+        WHEN p.resident_size > 1073741824              THEN 'high_over_1gb'
+        WHEN p.resident_size > 524288000               THEN 'elevated_over_500mb'
+        ELSE 'normal'
+      END                                               AS mem_pressure_flag
+
+    FROM processes p
+    WHERE
+      p.resident_size > 52428800
+      AND p.state != 'Z'
+    ORDER BY
+      p.resident_size DESC
+    LIMIT 25;
+  platform: darwin,linux
   logging: snapshot
 
 ---
@@ -291,16 +414,59 @@ spec:
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Application Experience - macOS Installed Applications
-  description: Inventory of installed macOS applications with version information.
+  name: DEX - Application Experience - macOS App Inventory with Recency
+  description: >
+    Installed apps with last_opened_time for adoption and shadow IT detection.
+    Confirms required apps are present/used and flags stale installs.
   query: |
     SELECT
-      name,
-      bundle_short_version AS version,
+      name                                              AS app_name,
+      bundle_identifier,
+      bundle_short_version                              AS version,
+      minimum_system_version                            AS min_os_required,
+      category,
       path,
-      'macos_apps' AS source
+
+      CASE
+        WHEN last_opened_time > 0
+        THEN ROUND((strftime('%s','now') - last_opened_time) / 86400.0, 0)
+        ELSE NULL
+      END                                               AS days_since_last_opened,
+
+      CASE
+        WHEN last_opened_time = 0
+          OR last_opened_time IS NULL                  THEN 'never_opened'
+        WHEN (strftime('%s','now') - last_opened_time)
+             < 86400                                   THEN 'opened_today'
+        WHEN (strftime('%s','now') - last_opened_time)
+             < 604800                                  THEN 'opened_this_week'
+        WHEN (strftime('%s','now') - last_opened_time)
+             < 2592000                                 THEN 'opened_this_month'
+        ELSE 'stale_over_30_days'
+      END                                               AS usage_recency,
+
+      CASE
+        WHEN bundle_identifier LIKE 'com.microsoft%'  THEN 'microsoft_suite'
+        WHEN bundle_identifier LIKE 'com.google%'     THEN 'google_suite'
+        WHEN bundle_identifier LIKE 'com.tinyspeck%'
+          OR bundle_identifier LIKE 'com.slack%'      THEN 'communication'
+        WHEN bundle_identifier LIKE 'us.zoom%'        THEN 'communication'
+        WHEN bundle_identifier LIKE 'com.apple%'      THEN 'apple_builtin'
+        WHEN bundle_identifier LIKE 'com.adobe%'      THEN 'creative'
+        WHEN bundle_identifier LIKE 'com.figma%'      THEN 'creative'
+        WHEN category = 'public.app-category.developer-tools'
+                                                      THEN 'dev_tooling'
+        ELSE 'other'
+      END                                               AS app_category
+
     FROM apps
-    WHERE name != '';
+    WHERE
+      bundle_package_type = 'APPL'
+      AND path NOT LIKE '/System/%'
+      AND path NOT LIKE '/usr/%'
+      AND name NOT LIKE '%.plugin'
+    ORDER BY
+      days_since_last_opened ASC NULLS LAST;
   platform: darwin
   logging: snapshot
 
@@ -416,8 +582,10 @@ spec:
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Network Experience - WiFi Signal Quality
-  description: WiFi connection signal strength and quality metrics. Poor WiFi directly impacts cloud application performance and user experience.
+  name: DEX - Network Experience - WiFi Quality and Band Scoring
+  description: >
+    Scores WiFi connection quality using channel, band, transmit_rate, RSSI, noise.
+    Flags band-degradation (stuck on 2.4GHz) and computes composite DEX wifi score.
   query: |
     SELECT
       interface,
@@ -425,23 +593,64 @@ spec:
       bssid,
       network_name,
       country_code,
+      security_type,
       rssi,
       noise,
-      (rssi - noise) AS signal_to_noise_ratio,
       channel,
       channel_width,
       channel_band,
       transmit_rate,
-      security_type,
+
+      CASE channel_band
+        WHEN 1 THEN '2.4GHz'
+        WHEN 2 THEN '5GHz'
+        WHEN 3 THEN '6GHz'
+        ELSE 'unknown'
+      END                                               AS wifi_band,
+
       CASE
         WHEN rssi >= -50 THEN 'excellent'
-        WHEN rssi >= -60 THEN 'good'
-        WHEN rssi >= -70 THEN 'fair'
-        WHEN rssi >= -80 THEN 'weak'
-        ELSE 'very_weak'
-      END AS signal_quality
+        WHEN rssi >= -65 THEN 'good'
+        WHEN rssi >= -75 THEN 'fair'
+        WHEN rssi >= -85 THEN 'poor'
+        ELSE 'unusable'
+      END                                               AS signal_quality,
+
+      (rssi - noise)                                    AS snr_db,
+      CASE
+        WHEN (rssi - noise) >= 25 THEN 'good_snr'
+        WHEN (rssi - noise) >= 15 THEN 'marginal_snr'
+        ELSE 'degraded_snr'
+      END                                               AS snr_quality,
+
+      CASE
+        WHEN channel_band = 1 THEN 1
+        ELSE 0
+      END                                               AS stuck_on_2_4ghz,
+
+      CASE
+        WHEN channel_width >= 80  THEN 'wide_80mhz_plus'
+        WHEN channel_width >= 40  THEN 'medium_40mhz'
+        WHEN channel_width >= 20  THEN 'narrow_20mhz'
+        ELSE 'unknown_width'
+      END                                               AS channel_width_class,
+
+      CASE
+        WHEN channel_band IN (2,3)
+             AND rssi >= -65
+             AND (rssi - noise) >= 20
+             AND channel_width >= 40
+        THEN 'dex_wifi_good'
+        WHEN channel_band = 1
+             OR rssi < -75
+             OR (rssi - noise) < 15
+        THEN 'dex_wifi_degraded'
+        ELSE 'dex_wifi_acceptable'
+      END                                               AS dex_wifi_score
+
     FROM wifi_status
-    WHERE ssid IS NOT NULL AND ssid != '';
+    WHERE interface IS NOT NULL
+      AND interface != '';
   platform: darwin
   logging: snapshot
 
@@ -494,30 +703,144 @@ spec:
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Network Experience - VPN Connection Status
-  description: Detects active VPN connections and tunnel interfaces. VPN issues significantly impact remote work experience.
+  name: DEX - Network Context - Interface Classification (macOS)
+  description: >
+    Classifies each device's network posture: VPN type, managed vs unmanaged,
+    and flags split-tunnel risk. On macOS friendly_name is unavailable so VPN
+    product cannot be identified — only interface type is classified.
   query: |
     SELECT
-      id.interface,
-      id.type,
-      ia.address,
-      ia.mask,
+      interface,
+      type,
+      flags,
+      ibytes,
+      obytes,
+      ipackets,
+      opackets,
+      last_change,
+
       CASE
-        WHEN id.interface LIKE 'utun%' THEN 'macos_vpn_tunnel'
-        WHEN id.interface LIKE 'ppp%' THEN 'ppp_vpn'
-        WHEN id.interface LIKE 'tap%' THEN 'tap_vpn'
-        WHEN id.interface LIKE 'tun%' THEN 'tun_vpn'
-        WHEN id.type = 'tunnel' THEN 'tunnel'
+        WHEN interface LIKE 'utun%'                     THEN 'vpn_utun'
+        WHEN interface LIKE 'tun%'                      THEN 'vpn_tun'
+        WHEN interface LIKE 'ppp%'                      THEN 'vpn_ppp'
+        WHEN interface LIKE 'ipsec%'                    THEN 'vpn_ipsec'
+        WHEN interface = 'en0'                          THEN 'wifi_primary'
+        WHEN interface = 'en1'                          THEN 'ethernet_or_secondary'
+        WHEN interface LIKE 'en%'                       THEN 'ethernet_other'
+        WHEN interface LIKE 'awdl%'                     THEN 'airdrop_awdl'
+        WHEN interface LIKE 'bridge%'                   THEN 'bridge'
         ELSE 'other'
-      END AS vpn_type
-    FROM interface_details id
-    LEFT JOIN interface_addresses ia ON id.interface = ia.interface
-    WHERE id.interface LIKE 'utun%'
-       OR id.interface LIKE 'ppp%'
-       OR id.interface LIKE 'tap%'
-       OR id.interface LIKE 'tun%'
-       OR id.type = 'tunnel';
-  platform: darwin,linux,windows
+      END                                               AS interface_class,
+
+      CASE
+        WHEN interface LIKE 'utun%'
+          OR interface LIKE 'tun%'
+          OR interface LIKE 'ppp%'
+          OR interface LIKE 'ipsec%'
+        THEN 1 ELSE 0
+      END                                               AS is_vpn_interface,
+
+      CASE
+        WHEN ipackets > 0 AND opackets > 0 THEN 1
+        ELSE 0
+      END                                               AS is_active,
+
+      CASE
+        WHEN (interface LIKE 'utun%' OR interface LIKE 'tun%'
+              OR interface LIKE 'ppp%' OR interface LIKE 'ipsec%')
+             AND ipackets > 0
+        THEN 'managed_vpn_active'
+        WHEN interface = 'en0' AND (
+             SELECT COUNT(*) FROM interface_details
+             WHERE (interface LIKE 'utun%' OR interface LIKE 'tun%'
+                    OR interface LIKE 'ipsec%')
+                   AND ipackets > 0
+        ) > 0
+        THEN 'wifi_with_vpn_overlay'
+        WHEN interface = 'en0'
+        THEN 'wifi_unmanaged'
+        ELSE 'non_primary'
+      END                                               AS dex_network_posture
+
+    FROM interface_details
+    WHERE
+      interface != 'lo0'
+      AND flags != 0
+      AND (
+        interface LIKE 'en%'
+        OR interface LIKE 'utun%'
+        OR interface LIKE 'tun%'
+        OR interface LIKE 'ppp%'
+        OR interface LIKE 'ipsec%'
+      )
+    ORDER BY
+      is_vpn_interface DESC,
+      is_active DESC,
+      interface ASC;
+  platform: darwin
+  logging: snapshot
+
+---
+apiVersion: v1
+kind: query
+spec:
+  name: DEX - Network Context - Interface Classification (Windows)
+  description: >
+    Windows variant: uses friendly_name for VPN product identification.
+    friendly_name is populated on Windows and carries adapter display names.
+  query: |
+    SELECT
+      interface,
+      friendly_name,
+      type,
+      flags,
+      ibytes,
+      obytes,
+      ipackets,
+      opackets,
+      last_change,
+
+      CASE
+        WHEN friendly_name LIKE '%Cisco%'               THEN 'vpn_cisco_anyconnect'
+        WHEN friendly_name LIKE '%Palo%'
+          OR friendly_name LIKE '%GlobalProtect%'        THEN 'vpn_globalprotect'
+        WHEN friendly_name LIKE '%Zscaler%'             THEN 'vpn_zscaler'
+        WHEN friendly_name LIKE '%WireGuard%'           THEN 'vpn_wireguard'
+        WHEN friendly_name LIKE '%Fortinet%'
+          OR friendly_name LIKE '%FortiClient%'          THEN 'vpn_fortinet'
+        WHEN friendly_name LIKE '%VPN%'                 THEN 'vpn_generic'
+        WHEN friendly_name LIKE '%Wi-Fi%'
+          OR friendly_name LIKE '%Wireless%'             THEN 'wifi_primary'
+        WHEN friendly_name LIKE '%Ethernet%'            THEN 'ethernet'
+        ELSE 'other'
+      END                                               AS interface_class,
+
+      CASE
+        WHEN friendly_name LIKE '%VPN%'
+          OR friendly_name LIKE '%Cisco%'
+          OR friendly_name LIKE '%Palo%'
+          OR friendly_name LIKE '%GlobalProtect%'
+          OR friendly_name LIKE '%Zscaler%'
+          OR friendly_name LIKE '%WireGuard%'
+          OR friendly_name LIKE '%Fortinet%'
+          OR friendly_name LIKE '%FortiClient%'
+        THEN 1 ELSE 0
+      END                                               AS is_vpn_interface,
+
+      CASE
+        WHEN ipackets > 0 AND opackets > 0 THEN 1
+        ELSE 0
+      END                                               AS is_active
+
+    FROM interface_details
+    WHERE
+      flags != 0
+      AND interface != ''
+    ORDER BY
+      is_vpn_interface DESC,
+      is_active DESC,
+      interface ASC;
+  platform: windows
   logging: snapshot
 
 ---
@@ -669,23 +992,73 @@ spec:
 apiVersion: v1
 kind: query
 spec:
-  name: DEX - Hardware Inventory - macOS Device Details
-  description: macOS-specific hardware details including Apple Silicon/Intel architecture and device identifiers.
+  name: DEX - Hardware Inventory - Hardware Profile with CPU and OS Tiering
+  description: >
+    Single-row snapshot per device: chip generation, core counts, RAM tier, OS currency,
+    and uptime flag. Foundation for segmenting all other DEX metrics by hardware tier.
   query: |
     SELECT
+      si.hostname,
+      si.uuid                                           AS device_uuid,
+      si.computer_name,
+      si.hardware_vendor,
       si.hardware_model,
-      si.hardware_serial,
-      si.cpu_brand,
+
       CASE
-        WHEN si.cpu_brand LIKE '%Apple%' THEN 'Apple Silicon'
-        ELSE 'Intel'
-      END AS architecture,
-      sv.version AS macos_version,
-      sv.build AS macos_build,
-      sv.platform AS platform_type
+        WHEN ci.model LIKE '%Apple M4%'               THEN 'apple_silicon_m4'
+        WHEN ci.model LIKE '%Apple M3%'               THEN 'apple_silicon_m3'
+        WHEN ci.model LIKE '%Apple M2%'               THEN 'apple_silicon_m2'
+        WHEN ci.model LIKE '%Apple M1%'               THEN 'apple_silicon_m1'
+        WHEN ci.model LIKE '%Intel%Core i9%'          THEN 'intel_i9'
+        WHEN ci.model LIKE '%Intel%Core i7%'          THEN 'intel_i7'
+        WHEN ci.model LIKE '%Intel%Core i5%'          THEN 'intel_i5'
+        WHEN ci.model LIKE '%Intel%'                  THEN 'intel_other'
+        ELSE 'unknown_cpu'
+      END                                               AS cpu_class,
+
+      ci.model                                          AS cpu_model_full,
+      ci.number_of_cores                                AS cpu_cores,
+      ci.logical_processors,
+      ci.max_clock_speed                                AS cpu_max_mhz,
+
+      ROUND(CAST(si.physical_memory AS REAL) / 1073741824, 1)
+                                                        AS ram_gb,
+
+      CASE
+        WHEN si.physical_memory >= 34359738368        THEN 'ram_32gb_plus'
+        WHEN si.physical_memory >= 17179869184        THEN 'ram_16gb'
+        WHEN si.physical_memory >= 8589934592         THEN 'ram_8gb'
+        ELSE 'ram_under_8gb'
+      END                                               AS ram_tier,
+
+      ov.name                                           AS os_name,
+      ov.version                                        AS os_version,
+      ov.build                                          AS os_build,
+      ov.major || '.' || ov.minor                       AS os_major_minor,
+
+      CASE
+        WHEN ov.major >= 15                           THEN 'current'
+        WHEN ov.major = 14                            THEN 'n_minus_1'
+        WHEN ov.major = 13                            THEN 'n_minus_2'
+        ELSE 'legacy'
+      END                                               AS os_currency,
+
+      u.total_seconds                                   AS uptime_seconds,
+      ROUND(CAST(u.total_seconds AS REAL) / 86400, 1)
+                                                        AS uptime_days,
+
+      CASE
+        WHEN u.total_seconds > 1209600               THEN 'over_14_days'
+        WHEN u.total_seconds > 604800                THEN 'over_7_days'
+        WHEN u.total_seconds > 172800                THEN 'over_2_days'
+        ELSE 'fresh'
+      END                                               AS uptime_flag
+
     FROM system_info si
-    CROSS JOIN os_version sv;
-  platform: darwin
+    CROSS JOIN cpu_info ci
+    CROSS JOIN os_version ov
+    CROSS JOIN uptime u;
+  platform: darwin,linux,windows
   logging: snapshot
 
 ---
