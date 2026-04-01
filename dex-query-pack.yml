@@ -1036,10 +1036,11 @@ spec:
       ov.build                                          AS os_build,
       ov.major || '.' || ov.minor                       AS os_major_minor,
 
+      -- macOS 26 = Tahoe, 15 = Sequoia, 14 = Sonoma
       CASE
-        WHEN ov.major >= 15                           THEN 'current'
-        WHEN ov.major = 14                            THEN 'n_minus_1'
-        WHEN ov.major = 13                            THEN 'n_minus_2'
+        WHEN ov.major >= 26                           THEN 'current'
+        WHEN ov.major = 15                            THEN 'n_minus_1'
+        WHEN ov.major = 14                            THEN 'n_minus_2'
         ELSE 'legacy'
       END                                               AS os_currency,
 
@@ -1243,7 +1244,7 @@ spec:
       arch AS architecture,
       install_date,
       CASE
-        WHEN platform = 'darwin' AND major < 14 THEN 'outdated'
+        WHEN platform = 'darwin' AND major < 15 THEN 'outdated'
         WHEN platform = 'windows' AND build < 19045 THEN 'outdated'
         ELSE 'current'
       END AS version_status
